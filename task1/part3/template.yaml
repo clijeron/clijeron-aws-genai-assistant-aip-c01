@@ -1,0 +1,183 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AI Assistant — cross-region self-contained stack (Lambda + API Gateway) for HA/failover'
+
+# ---------------------------------------------------------------------------
+# WHAT CHANGED vs. the assignment's cross-region template (CHANGELOG Part 3):
+#   P3-16  Lambda reads the model from an ENV VAR (PrimaryModel), NOT from the
+#          us-west-2 AppConfig. Pointing the secondary region at the primary
+#          region's AppConfig would create a single-region dependency — the
+#          exact thing cross-region HA is meant to eliminate. Each region is
+#          therefore self-contained.
+#   P3-17  Real Lambda code (Converse API, no topP, dual invocation shape),
+#          not the assignment's `pass` placeholder.
+#   P3-18  Runtime python3.12 (assignment used EOL python3.9).
+#   P3-19  Added AWS::Lambda::Permission so API Gateway can invoke the Lambda
+#          (assignment's cross-region template omitted it → 500 at the edge).
+#   Tagging: applied at the stack level via `--tags auto-delete=true` on
+#            `cloudformation deploy` (propagates to all taggable resources),
+#            so no per-resource Tags blocks are needed.
+# ---------------------------------------------------------------------------
+
+Parameters:
+  PrimaryModel:
+    Type: String
+    Default: us.amazon.nova-lite-v1:0
+    Description: Bedrock model (inference-profile ID) this region serves.
+  StageName:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, prod]
+
+Resources:
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: BedrockInvoke
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'bedrock:InvokeModel'
+                Resource: '*'
+
+  ModelAbstractionLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "ai-assistant-model-abstraction-${AWS::Region}"
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.12          # P3-18
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          PRIMARY_MODEL: !Ref PrimaryModel   # P3-16
+      Code:
+        ZipFile: |
+          import os, json, boto3
+          REGION = os.environ.get("AWS_REGION", "us-east-1")
+          MODEL = os.environ.get("PRIMARY_MODEL", "us.amazon.nova-lite-v1:0")
+          br = boto3.client("bedrock-runtime", region_name=REGION)
+
+          def lambda_handler(event, context):
+              # Dual invocation shape (P3-11): API Gateway wraps payload in body.
+              raw = event.get("body")
+              if isinstance(raw, str):
+                  body = json.loads(raw or "{}")
+              elif isinstance(raw, dict):
+                  body = raw
+              else:
+                  body = event
+              prompt = body.get("prompt", "")
+              use_case = body.get("use_case", "general")
+              is_apigw = "body" in event
+              try:
+                  r = br.converse(
+                      modelId=MODEL,
+                      messages=[{"role": "user", "content": [{"text": prompt}]}],
+                      inferenceConfig={"maxTokens": 500, "temperature": 0.7},  # no topP
+                  )
+                  out = r["output"]["message"]["content"][0]["text"]
+              except Exception as e:
+                  if is_apigw:
+                      return {"statusCode": 500,
+                              "headers": {"Content-Type": "application/json"},
+                              "body": json.dumps({"model_used": MODEL, "error": str(e)})}
+                  raise
+              return {"statusCode": 200,
+                      "headers": {"Content-Type": "application/json"},
+                      "body": json.dumps({"model_used": MODEL, "response": out})}
+
+  ApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub "ai-assistant-api-${AWS::Region}"
+      Description: Cross-region AI Assistant endpoint
+
+  ApiResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: generate
+
+  # P3-21: GET /health (MOCK 200) so Route 53 health checks have a cheap,
+  # body-less target in this region (a body-less POST /generate would send an
+  # empty prompt to Bedrock and flap). Matches the us-west-2 /health added by
+  # r53_01_health.sh.
+  HealthResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: health
+
+  HealthMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref HealthResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseTemplates:
+              application/json: '{"status":"ok"}'
+      MethodResponses:
+        - StatusCode: 200
+
+  ApiMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref ApiResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ModelAbstractionLambda.Arn}/invocations"
+
+  # P3-19: allow API Gateway to invoke the Lambda
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ModelAbstractionLambda
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*/POST/generate"
+
+  # P3-21: logical id bumped (ApiDeployment -> ApiDeploymentV2) to force the
+  # stage to REDEPLOY and actually publish the new /health method. An
+  # AWS::ApiGateway::Deployment only re-publishes when its logical id changes;
+  # adding a method without this leaves /health absent from the live stage.
+  ApiDeploymentV2:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: [ApiMethod, HealthMethod]
+    Properties:
+      RestApiId: !Ref ApiGateway
+      StageName: !Ref StageName
+
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway endpoint URL
+    Value: !Sub "https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${StageName}/generate"
+  LambdaArn:
+    Description: Lambda function ARN
+    Value: !GetAtt ModelAbstractionLambda.Arn

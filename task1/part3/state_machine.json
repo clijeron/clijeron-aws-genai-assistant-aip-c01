@@ -1,0 +1,91 @@
+{
+  "Comment": "AI Assistant with retry + fallback + graceful degradation (see CHANGELOG Part 3 note: this is a retry-with-fallback chain, NOT a true circuit breaker).",
+  "StartAt": "TryPrimaryModel",
+  "States": {
+    "TryPrimaryModel": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${PrimaryModelLambdaArn}",
+        "Payload": {
+          "prompt.$": "$.prompt",
+          "use_case.$": "$.use_case"
+        }
+      },
+      "ResultSelector": {
+        "statusCode.$": "$.Payload.statusCode",
+        "body.$": "$.Payload.body"
+      },
+      "ResultPath": "$.result",
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.TooManyRequestsException", "States.TaskFailed"],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 2,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "TryFallbackModel"
+        }
+      ],
+      "Next": "SuccessState"
+    },
+    "TryFallbackModel": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${FallbackModelLambdaArn}",
+        "Payload": {
+          "prompt.$": "$.prompt",
+          "use_case.$": "$.use_case",
+          "is_fallback": true
+        }
+      },
+      "ResultSelector": {
+        "statusCode.$": "$.Payload.statusCode",
+        "body.$": "$.Payload.body"
+      },
+      "ResultPath": "$.result",
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.TooManyRequestsException", "States.TaskFailed"],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 2,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "GracefulDegradation"
+        }
+      ],
+      "Next": "SuccessState"
+    },
+    "GracefulDegradation": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${DegradationLambdaArn}",
+        "Payload": {
+          "prompt.$": "$.prompt",
+          "use_case.$": "$.use_case"
+        }
+      },
+      "ResultSelector": {
+        "statusCode.$": "$.Payload.statusCode",
+        "body.$": "$.Payload.body"
+      },
+      "ResultPath": "$.result",
+      "Next": "SuccessState"
+    },
+    "SuccessState": {
+      "Type": "Succeed"
+    }
+  }
+}

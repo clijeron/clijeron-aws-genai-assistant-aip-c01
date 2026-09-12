@@ -1,0 +1,5 @@
+# P4-14: installed into the PyTorch training container before train.py runs.
+# The base PyTorch DLC does not include these; the HuggingFace DLC would, but
+# it is GPU-only, so we use the CPU-capable PyTorch DLC + these deps instead.
+transformers==4.26.1
+datasets==2.10.1
